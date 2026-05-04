@@ -1,141 +1,87 @@
-"""Hybrid retrieval combining vector search (KB) + graph traversal (Neptune)."""
-import os
+"""Hybrid retrieval: LocalKB (Chroma) + LocalGraph (Neo4j) fused with RRF.
+
+Both retrievers run on the same query, their hits are sorted independently,
+then merged with Reciprocal Rank Fusion. Atlas Cloud generates the final
+grounded answer over the fused context.
+"""
 import sys
-import json
-import boto3
-from rich.console import Console
-from rich.table import Table
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from openai import OpenAI  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.table import Table  # noqa: E402
+
+from modules.local.config import ATLAS_API_KEY, ATLAS_BASE_URL, ATLAS_MODEL  # noqa: E402
+from modules.local.graph import LocalGraph  # noqa: E402
+from modules.local.kb import default_kb  # noqa: E402
 
 console = Console()
-bedrock_runtime = boto3.client("bedrock-agent-runtime")
-bedrock_rt = boto3.client("bedrock-runtime")
-neptune = boto3.client("neptune-graph")
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
-
-KB_ID = config["knowledge_base_id"]
-GRAPH_ID = config["neptune_graph_id"]
-
-query = " ".join(sys.argv[1:]) or "What metrics should I check for month-end close and why were the thresholds set this way?"
+query = " ".join(sys.argv[1:]) or (
+    "What metrics should I check for month-end close and why were the "
+    "thresholds set this way?"
+)
 console.print(f"\n🔍 [bold]Query:[/] {query}\n")
 
-
-def get_embedding(text: str) -> list[float]:
-    response = bedrock_rt.invoke_model(
-        modelId="amazon.titan-embed-text-v2:0",
-        body=json.dumps({"inputText": text}),
-    )
-    return json.loads(response["body"].read())["embedding"]
-
-
-# --- Source 1: Vector search from Bedrock KB ---
-console.print("[bold cyan]Source 1: Bedrock Knowledge Base (Vector Search)[/]")
-kb_results = bedrock_runtime.retrieve(
-    knowledgeBaseId=KB_ID,
-    retrievalQuery={"text": query},
-    retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 5}},
-)
-
+# --- Source 1: Local Knowledge Base (Chroma vector search) ---
+console.print("[bold cyan]Source 1: Local KB (Chroma vector search)[/]")
+kb = default_kb()
+if kb.count == 0:
+    kb.ingest_data_dir()
+kb_hits = kb.retrieve(query, top_k=5)
 vector_chunks = []
-for r in kb_results["retrievalResults"]:
-    text = r.get("content", {}).get("text", "")
-    score = r.get("score", 0)
-    vector_chunks.append({"text": text, "score": score, "source": "KB"})
-    console.print(f"  [{score:.3f}] {text[:100]}...")
+for h in kb_hits:
+    vector_chunks.append({"text": h.text, "score": h.score, "source": "KB"})
+    console.print(f"  [{h.score:.3f}] {h.text[:100]}...".replace("\n", " "))
 
-# --- Source 2: Graph search from Neptune Analytics ---
-console.print(f"\n[bold cyan]Source 2: Neptune Analytics (Graph + Vector)[/]")
-query_embedding = get_embedding(query)
-
-# Vector search in graph
-graph_response = neptune.execute_query(
-    graphIdentifier=GRAPH_ID,
-    queryString=f"""
-        CALL neptune.algo.vectors.topKByNode({{
-            queryVector: {query_embedding},
-            topK: 5
-        }})
-        YIELD node, score
-        OPTIONAL MATCH (node)-[r]-(connected)
-        RETURN labels(node) AS type, node.name AS name,
-               node.description AS description, score,
-               collect(DISTINCT {{
-                   rel: type(r),
-                   target: connected.name,
-                   target_type: labels(connected)
-               }})[..5] AS connections
-        ORDER BY score DESC
-    """,
-    language="OPEN_CYPHER",
-)
-
-graph_data = json.loads(graph_response["payload"].read())
+# --- Source 2: Context Graph (Neo4j vector + traversal) ---
+console.print(f"\n[bold cyan]Source 2: Context Graph (Neo4j vector + traversal)[/]")
 graph_chunks = []
-for r in graph_data.get("results", []):
-    name = r.get("name", "")
-    desc = r.get("description", "")
-    score = r.get("score", 0)
-    connections = r.get("connections", [])
+with LocalGraph() as g:
+    graph_hits = g.vector_search(query, top_k=5)
+    for h in graph_hits:
+        p = h.properties
+        desc = p.get("description") or p.get("decision") or ""
+        connections = g.neighbors(h.name, limit=5) if h.name else []
+        context_parts = [f"{h.name}: {desc}"]
+        for c in connections:
+            if c.get("target"):
+                context_parts.append(f"  → {c['rel']}: {c['target']}")
+        graph_chunks.append({
+            "text": "\n".join(context_parts),
+            "score": h.score,
+            "source": "Graph",
+        })
+        console.print(f"  [{h.score:.3f}] {h.name}: {desc[:80]}...".replace("\n", " "))
+        for c in connections[:3]:
+            if c.get("target"):
+                console.print(f"    → {c['rel']}: {c['target']}")
 
-    context_parts = [f"{name}: {desc}"]
-    for conn in connections:
-        if conn.get("target"):
-            context_parts.append(
-                f"  → {conn['rel']}: {conn['target']}"
-            )
-
-    full_text = "\n".join(context_parts)
-    graph_chunks.append({"text": full_text, "score": score, "source": "Graph"})
-    console.print(f"  [{score:.3f}] {name}: {desc[:80]}...")
-    for conn in connections[:3]:
-        if conn.get("target"):
-            console.print(f"    → {conn['rel']}: {conn['target']}")
-
-# --- Source 3: Decision traces ---
-console.print(f"\n[bold cyan]Source 3: Decision Traces (Event Clock)[/]")
-trace_response = neptune.execute_query(
-    graphIdentifier=GRAPH_ID,
-    queryString=f"""
-        CALL neptune.algo.vectors.topKByNode({{
-            queryVector: {query_embedding},
-            topK: 3,
-            nodeLabels: ['Decision', 'DecisionTrace']
-        }})
-        YIELD node, score
-        RETURN labels(node) AS type, node.title AS title,
-               node.decision AS decision, node.rationale AS rationale,
-               node.context AS context, score
-        ORDER BY score DESC
-    """,
-    language="OPEN_CYPHER",
-)
-
-trace_data = json.loads(trace_response["payload"].read())
-for r in trace_data.get("results", []):
-    title = r.get("title", r.get("decision", "N/A"))
-    rationale = r.get("rationale", r.get("context", ""))
-    score = r.get("score", 0)
-    graph_chunks.append({
-        "text": f"Decision: {title}. Rationale: {rationale}",
-        "score": score,
-        "source": "Decision",
-    })
-    console.print(f"  [{score:.3f}] {title}: {rationale[:80]}...")
+    # --- Source 3: Decision/DecisionTrace nodes ---
+    console.print(f"\n[bold cyan]Source 3: Decision Traces (Event Clock)[/]")
+    decision_hits = g.vector_search(query, top_k=3, labels=["Decision", "DecisionTrace"])
+    for h in decision_hits:
+        p = h.properties
+        title = p.get("title") or p.get("decision") or "N/A"
+        rationale = p.get("rationale") or p.get("context") or ""
+        graph_chunks.append({
+            "text": f"Decision: {title}. Rationale: {rationale}",
+            "score": h.score,
+            "source": "Decision",
+        })
+        console.print(f"  [{h.score:.3f}] {title}: {rationale[:80]}...".replace("\n", " "))
 
 # --- Reciprocal Rank Fusion ---
 console.print(f"\n[bold cyan]Fused Results (Reciprocal Rank Fusion)[/]")
-
-K = 60  # RRF constant
-all_items = {}
-
+K = 60
+all_items: dict[str, dict] = {}
 for rank, chunk in enumerate(sorted(vector_chunks, key=lambda x: -x["score"])):
     key = chunk["text"][:100]
     all_items.setdefault(key, {"text": chunk["text"], "rrf_score": 0, "sources": []})
     all_items[key]["rrf_score"] += 1 / (K + rank + 1)
     all_items[key]["sources"].append(chunk["source"])
-
 for rank, chunk in enumerate(sorted(graph_chunks, key=lambda x: -x["score"])):
     key = chunk["text"][:100]
     all_items.setdefault(key, {"text": chunk["text"], "rrf_score": 0, "sources": []})
@@ -146,34 +92,31 @@ fused = sorted(all_items.values(), key=lambda x: -x["rrf_score"])[:5]
 
 table = Table(title="Top 5 Fused Results")
 table.add_column("RRF Score", justify="right", width=10)
-table.add_column("Sources", width=15)
-table.add_column("Content", width=60)
-
+table.add_column("Sources", width=18)
+table.add_column("Content", width=70)
 for item in fused:
     table.add_row(
         f"{item['rrf_score']:.4f}",
-        ", ".join(set(item["sources"])),
-        item["text"][:120] + "...",
+        ", ".join(sorted(set(item["sources"]))),
+        item["text"][:120].replace("\n", " ") + "...",
     )
-
 console.print(table)
 
-# --- Generate final answer with all context ---
-console.print(f"\n[bold cyan]Final Answer (with full context)[/]")
-context = "\n\n".join(item["text"][:500] for item in fused)
+# --- Final answer with full fused context ---
+console.print(f"\n[bold cyan]Final Answer (with full fused context)[/]")
+context = "\n\n---\n\n".join(item["text"][:500] for item in fused)
 
-response = bedrock_rt.invoke_model(
-    modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
-    body=json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": (
-            f"Answer this question using the provided context. "
-            f"Include both WHAT is true and WHY (cite decisions and rationale).\n\n"
-            f"Question: {query}\n\nContext:\n{context}"
-        )}],
-    }),
+client = OpenAI(api_key=ATLAS_API_KEY, base_url=ATLAS_BASE_URL)
+resp = client.chat.completions.create(
+    model=ATLAS_MODEL,
+    messages=[
+        {"role": "system",
+         "content": "Answer using the provided context. Include both WHAT is "
+                    "true now and WHY (cite decisions and rationale)."},
+        {"role": "user",
+         "content": f"Question: {query}\n\nContext:\n{context}"},
+    ],
+    max_tokens=1024,
 )
 
-answer = json.loads(response["body"].read())["content"][0]["text"]
-console.print(f"\n💬 {answer}")
+console.print(f"\n💬 {resp.choices[0].message.content}")

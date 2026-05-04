@@ -14,4 +14,8 @@ LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-qwen3-embedding-0.6b")
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "1024"))
 
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "workshop-pass")
+
 DATA_DIR = REPO_ROOT / "modules" / "01-knowledge-base-setup" / "data"

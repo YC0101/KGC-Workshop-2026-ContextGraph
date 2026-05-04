@@ -1,36 +1,32 @@
-"""Populate the Neptune Analytics graph with entities and relationships."""
-import os
+"""Populate the local Neo4j context graph with entities and relationships.
+
+For each AFS document:
+  1. Create a :Document node with content embedding.
+  2. Ask Atlas Cloud (Claude Sonnet 4.6) to extract entities, relationships,
+     and decisions as JSON.
+  3. Upsert each entity as a labelled node (with embedding for vector search).
+  4. Upsert each relationship.
+  5. Upsert each decision as a :Decision node and link to its document.
+"""
 import json
-import glob
-import boto3
+import re
+import sys
+from pathlib import Path
 
-neptune = boto3.client("neptune-graph")
-bedrock_runtime = boto3.client("bedrock-runtime")
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
+from openai import OpenAI  # noqa: E402
 
-GRAPH_ID = config["neptune_graph_id"]
-EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+from modules.local.config import (  # noqa: E402
+    ATLAS_API_KEY, ATLAS_BASE_URL, ATLAS_MODEL, DATA_DIR,
+)
+from modules.local.graph import LocalGraph  # noqa: E402
 
-
-def get_embedding(text: str) -> list[float]:
-    """Generate embedding using Titan Embeddings V2."""
-    response = bedrock_runtime.invoke_model(
-        modelId=EMBED_MODEL,
-        body=json.dumps({"inputText": text[:8000]}),
-    )
-    return json.loads(response["body"].read())["embedding"]
-
-
-def extract_entities_with_llm(text: str, doc_name: str) -> dict:
-    """Use Claude to extract entities and relationships from text."""
-    prompt = f"""Extract entities and relationships from this AFS financial operations document.
+EXTRACTION_PROMPT = """Extract entities and relationships from this AFS financial operations document.
 
 Document: {doc_name}
 ---
-{text[:6000]}
+{text}
 ---
 
 Return a JSON object with:
@@ -42,147 +38,116 @@ Return a JSON object with:
 
 Return ONLY valid JSON, no other text."""
 
-    response = bedrock_runtime.invoke_model(
-        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
-        body=json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 4096,
-            "messages": [{"role": "user", "content": prompt}],
-        }),
-    )
-    result = json.loads(response["body"].read())
-    content = result["content"][0]["text"]
 
-    # Parse JSON from response
+client = OpenAI(api_key=ATLAS_API_KEY, base_url=ATLAS_BASE_URL)
+
+
+def extract_entities(text: str, doc_name: str) -> dict:
+    resp = client.chat.completions.create(
+        model=ATLAS_MODEL,
+        messages=[{"role": "user", "content": EXTRACTION_PROMPT.format(
+            doc_name=doc_name, text=text[:6000]
+        )}],
+        max_tokens=8192,
+    )
+    content = resp.choices[0].message.content or ""
+    content = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", content.strip(), flags=re.MULTILINE)
     start = content.find("{")
     end = content.rfind("}") + 1
     return json.loads(content[start:end])
 
 
-def execute_query(query: str):
-    """Execute an openCypher query against Neptune Analytics."""
-    try:
-        response = neptune.execute_query(
-            graphIdentifier=GRAPH_ID,
-            queryString=query,
-            language="OPEN_CYPHER",
-        )
-        return response.get("payload")
-    except Exception as e:
-        print(f"  Query error: {e}")
-        return None
+def main() -> None:
+    docs = sorted(Path(DATA_DIR).glob("*.md"))
+    print(f"Processing {len(docs)} documents...\n")
+
+    n_entities = n_relationships = n_decisions = 0
+
+    with LocalGraph() as g:
+        for path in docs:
+            doc_name = path.name
+            print(f"📄 Processing: {doc_name}")
+            text = path.read_text()
+
+            g.upsert_node(
+                label="Document",
+                identity_key="name",
+                identity_value=doc_name,
+                properties={
+                    "content_preview": text[:200],
+                    "char_count": len(text),
+                },
+                embed_text=text[:2000],
+            )
+
+            try:
+                extracted = extract_entities(text, doc_name)
+            except Exception as e:
+                print(f"  ⚠️  extraction failed: {e}")
+                continue
+
+            for entity in extracted.get("entities", []) or []:
+                name = (entity.get("name") or "").strip()
+                etype = (entity.get("type") or "Entity").strip() or "Entity"
+                desc = (entity.get("description") or "").strip()
+                if not name:
+                    continue
+                g.upsert_node(
+                    label=etype,
+                    identity_key="name",
+                    identity_value=name,
+                    properties={"description": desc, "type": etype},
+                    embed_text=f"{name}: {desc}",
+                )
+                g.upsert_edge(doc_name, "MENTIONS", name)
+                n_entities += 1
+                print(f"  + Entity: [{etype}] {name}")
+
+            for rel in extracted.get("relationships", []) or []:
+                src = (rel.get("source") or "").strip()
+                tgt = (rel.get("target") or "").strip()
+                rtype = (rel.get("type") or "RELATED").strip() or "RELATED"
+                desc = (rel.get("description") or "").strip()
+                if not src or not tgt:
+                    continue
+                ok = g.upsert_edge(src, rtype, tgt, {"description": desc})
+                if ok:
+                    n_relationships += 1
+                    print(f"  → Relationship: {src} --[{rtype}]--> {tgt}")
+
+            for decision in extracted.get("decisions", []) or []:
+                dec_id = (decision.get("id") or "").strip()
+                if not dec_id:
+                    continue
+                title = decision.get("title", "")
+                ctx = decision.get("context", "")
+                dec_text = decision.get("decision", "")
+                rationale = decision.get("rationale", "")
+                g.upsert_node(
+                    label="Decision",
+                    identity_key="id",
+                    identity_value=dec_id,
+                    properties={
+                        "title": title,
+                        "date": decision.get("date", "unknown"),
+                        "context": ctx,
+                        "decision": dec_text,
+                        "rationale": rationale,
+                        "name": dec_id,
+                    },
+                    embed_text=f"{title}: {ctx} {dec_text} {rationale}",
+                )
+                g.upsert_edge(doc_name, "CONTAINS_DECISION", dec_id)
+                n_decisions += 1
+                print(f"  ★ Decision: {title}")
+
+            print()
+
+    print(f"✅ Graph populated!")
+    print(f"   Entities: {n_entities}")
+    print(f"   Relationships: {n_relationships}")
+    print(f"   Decisions: {n_decisions}")
 
 
-# Load documents
-data_dir = os.path.join(
-    os.path.dirname(__file__), "..", "..", "01-knowledge-base-setup", "data"
-)
-doc_files = glob.glob(os.path.join(data_dir, "*.md"))
-
-print(f"Processing {len(doc_files)} documents...\n")
-
-all_entities = []
-all_relationships = []
-all_decisions = []
-
-for filepath in doc_files:
-    doc_name = os.path.basename(filepath)
-    print(f"📄 Processing: {doc_name}")
-
-    with open(filepath) as f:
-        text = f.read()
-
-    # Create document node
-    doc_embedding = get_embedding(text[:2000])
-    execute_query(f"""
-        CREATE (d:Document {{
-            name: '{doc_name}',
-            content_preview: '{text[:200].replace("'", "")}',
-            char_count: {len(text)},
-            embedding: {doc_embedding}
-        }})
-    """)
-
-    # Extract entities and relationships
-    extracted = extract_entities_with_llm(text, doc_name)
-
-    # Create entity nodes
-    for entity in extracted.get("entities", []):
-        name = entity["name"].replace("'", "")
-        desc = entity.get("description", "").replace("'", "")
-        entity_type = entity["type"]
-        embedding = get_embedding(f"{name}: {desc}")
-
-        execute_query(f"""
-            MERGE (e:{entity_type} {{name: '{name}'}})
-            ON CREATE SET
-                e.description = '{desc}',
-                e.embedding = {embedding}
-        """)
-
-        # Link entity to document
-        execute_query(f"""
-            MATCH (d:Document {{name: '{doc_name}'}})
-            MATCH (e:{entity_type} {{name: '{name}'}})
-            MERGE (d)-[:MENTIONS]->(e)
-        """)
-
-        all_entities.append(entity)
-        print(f"  + Entity: [{entity_type}] {name}")
-
-    # Create relationships
-    for rel in extracted.get("relationships", []):
-        source = rel["source"].replace("'", "")
-        target = rel["target"].replace("'", "")
-        rel_type = rel["type"]
-        desc = rel.get("description", "").replace("'", "")
-
-        execute_query(f"""
-            MATCH (s {{name: '{source}'}})
-            MATCH (t {{name: '{target}'}})
-            MERGE (s)-[r:{rel_type}]->(t)
-            ON CREATE SET r.description = '{desc}'
-        """)
-
-        all_relationships.append(rel)
-        print(f"  → Relationship: {source} --[{rel_type}]--> {target}")
-
-    # Create decision trace nodes
-    for decision in extracted.get("decisions", []):
-        dec_id = decision["id"].replace("'", "")
-        title = decision["title"].replace("'", "")
-        context = decision.get("context", "").replace("'", "")
-        dec_text = decision.get("decision", "").replace("'", "")
-        rationale = decision.get("rationale", "").replace("'", "")
-        date = decision.get("date", "unknown")
-
-        embedding = get_embedding(f"{title}: {context} {dec_text} {rationale}")
-
-        execute_query(f"""
-            CREATE (dec:Decision {{
-                id: '{dec_id}',
-                title: '{title}',
-                date: '{date}',
-                context: '{context}',
-                decision: '{dec_text}',
-                rationale: '{rationale}',
-                embedding: {embedding}
-            }})
-        """)
-
-        # Link decision to document
-        execute_query(f"""
-            MATCH (d:Document {{name: '{doc_name}'}})
-            MATCH (dec:Decision {{id: '{dec_id}'}})
-            MERGE (d)-[:CONTAINS_DECISION]->(dec)
-        """)
-
-        all_decisions.append(decision)
-        print(f"  ★ Decision: {title}")
-
-    print()
-
-print(f"✅ Graph populated!")
-print(f"   Entities: {len(all_entities)}")
-print(f"   Relationships: {len(all_relationships)}")
-print(f"   Decisions: {len(all_decisions)}")
+if __name__ == "__main__":
+    main()
