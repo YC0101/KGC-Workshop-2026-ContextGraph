@@ -1,28 +1,21 @@
 """Interactive chat with the fully integrated Agentic RAG system."""
-import os
 import sys
-import json
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from strands import Agent
-from strands.models.bedrock import BedrockModel
-from strands_tools import retrieve
-from tools.graph_tools import search_context_graph, record_decision, ingest_email_decision
+from strands import Agent  # noqa: E402
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
-
-os.environ["KNOWLEDGE_BASE_ID"] = config["knowledge_base_id"]
-
-model = BedrockModel(
-    model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
-    region_name="us-east-1",
+from modules.local.llm import build_llm  # noqa: E402
+from modules.local.retrieve import retrieve  # noqa: E402
+from tools.graph_tools import (  # noqa: E402
+    search_context_graph, record_decision, ingest_email_decision,
 )
 
+
 agent = Agent(
-    model=model,
+    model=build_llm(),
     tools=[retrieve, search_context_graph, record_decision, ingest_email_decision],
     system_prompt=(
         "You are the AFS Metrics Assistant for AWS CapEx financial operations. "

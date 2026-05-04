@@ -1,50 +1,42 @@
-"""Show all decision traces captured in the context graph."""
-import os
-import json
-import boto3
-from rich.console import Console
-from rich.panel import Panel
+"""Show all DecisionTrace nodes captured in the local context graph."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from rich.console import Console  # noqa: E402
+from rich.panel import Panel  # noqa: E402
+
+from modules.local.graph import LocalGraph  # noqa: E402
 
 console = Console()
-neptune = boto3.client("neptune-graph")
-
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
-
-GRAPH_ID = config["neptune_graph_id"]
-
 console.print("\n[bold]📝 Decision Traces in Context Graph[/]\n")
 
-response = neptune.execute_query(
-    graphIdentifier=GRAPH_ID,
-    queryString="""
+with LocalGraph() as g:
+    rows = g.cypher(
+        """
         MATCH (t:DecisionTrace)
-        OPTIONAL MATCH (t)-[r:CONSIDERED]->(e)
+        OPTIONAL MATCH (t)-[:CONSIDERED]->(e)
         RETURN t.id AS id, t.timestamp AS timestamp,
                t.user_query AS query, t.reasoning AS reasoning,
                t.decision AS decision,
-               collect(e.name) AS entities_considered
+               collect(coalesce(e.name, e.id)) AS entities_considered
         ORDER BY t.timestamp DESC
-    """,
-    language="OPEN_CYPHER",
-)
+        """
+    )
 
-results = json.loads(response["payload"].read())
-traces = results.get("results", [])
-
-if not traces:
+if not rows:
     console.print("[dim]No decision traces found. Run the integrated agent first.[/]")
 else:
-    console.print(f"Found {len(traces)} decision trace(s):\n")
-    for trace in traces:
-        entities = ", ".join(trace.get("entities_considered", [])) or "None"
+    console.print(f"Found {len(rows)} decision trace(s):\n")
+    for r in rows:
+        entities = ", ".join(e for e in r.get("entities_considered", []) if e) or "None"
         console.print(Panel(
-            f"[bold]Query:[/] {trace.get('query', 'N/A')}\n\n"
-            f"[bold]Reasoning:[/] {trace.get('reasoning', 'N/A')}\n\n"
-            f"[bold]Decision:[/] {trace.get('decision', 'N/A')}\n\n"
+            f"[bold]Query:[/] {r.get('query', 'N/A')}\n\n"
+            f"[bold]Reasoning:[/] {r.get('reasoning', 'N/A')}\n\n"
+            f"[bold]Decision:[/] {r.get('decision', 'N/A')}\n\n"
             f"[bold]Entities Considered:[/] {entities}\n"
-            f"[dim]Timestamp: {trace.get('timestamp', 'N/A')}[/]",
-            title=f"🔍 {trace.get('id', 'Unknown')}",
+            f"[dim]Timestamp: {r.get('timestamp', 'N/A')}[/]",
+            title=f"🔍 {r.get('id', 'Unknown')}",
             border_style="green",
         ))

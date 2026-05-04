@@ -1,30 +1,22 @@
-"""Integrated Strands agent with KB retrieval + context graph + decision recording."""
-import os
+"""Integrated agent: KB retrieve + context-graph search + decision recording + email ingestion."""
 import sys
-import json
+from pathlib import Path
 
-# Add tools directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from strands import Agent
-from strands.models.bedrock import BedrockModel
-from strands_tools import retrieve
-from tools.graph_tools import search_context_graph, record_decision, ingest_email_decision
+from strands import Agent  # noqa: E402
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
-
-os.environ["KNOWLEDGE_BASE_ID"] = config["knowledge_base_id"]
-
-model = BedrockModel(
-    model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
-    region_name="us-east-1",
+from modules.local.llm import build_llm  # noqa: E402
+from modules.local.retrieve import retrieve  # noqa: E402
+from tools.graph_tools import (  # noqa: E402
+    search_context_graph, record_decision, ingest_email_decision,
 )
+
 
 SYSTEM_PROMPT = """You are the AFS Metrics Assistant for AWS CapEx financial operations.
 
-You have access to three capabilities:
+You have access to four capabilities:
 
 1. **retrieve** — Search the knowledge base for metric definitions, reconciliation rules,
    namespace configurations, and compliance policies. Use this for WHAT is true now.
@@ -50,13 +42,14 @@ For every question:
 Always cite specific metric names, thresholds, and decision IDs.
 Distinguish between current configuration (KB) and historical context (graph)."""
 
+
 agent = Agent(
-    model=model,
+    model=build_llm(),
     tools=[retrieve, search_context_graph, record_decision, ingest_email_decision],
     system_prompt=SYSTEM_PROMPT,
 )
 
-# Demo queries that exercise all three tools
+
 queries = [
     "What metrics track PO aging for the LLE category and why is the threshold set to 90 days?",
     "We have 47 EMEA POs aging >90 days totaling $3.2M. Classify the risk and record your decision.",
@@ -77,7 +70,7 @@ queries = [
 
 for query in queries:
     print(f"\n{'='*70}")
-    print(f"🔍 Query: {query}")
+    print(f"🔍 Query: {query[:200]}{'...' if len(query) > 200 else ''}")
     print(f"{'='*70}")
     result = agent(query)
     print(f"\n💬 Answer:\n{result}")
