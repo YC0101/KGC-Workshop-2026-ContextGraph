@@ -1,20 +1,17 @@
-"""Query the Bedrock Knowledge Base and optionally show retrieval details."""
-import os
+"""Query the local-stack KB. Atlas Cloud generates a grounded answer from
+the top-k Chroma chunks; --verbose prints the chunks and similarity scores.
+"""
 import sys
-import json
-import boto3
+from pathlib import Path
 
-bedrock_runtime = boto3.client("bedrock-agent-runtime")
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
+from openai import OpenAI  # noqa: E402
 
-KB_ID = config["knowledge_base_id"]
-MODEL_ARN = (
-    "arn:aws:bedrock:us-east-1::foundation-model/"
-    "anthropic.claude-3-5-sonnet-20241022-v2:0"
+from modules.local.config import (  # noqa: E402
+    ATLAS_API_KEY, ATLAS_BASE_URL, ATLAS_MODEL,
 )
+from modules.local.kb import LocalKB  # noqa: E402
 
 verbose = "--verbose" in sys.argv
 query = " ".join(arg for arg in sys.argv[1:] if arg != "--verbose")
@@ -29,54 +26,47 @@ if not query:
 
 print(f"🔍 Query: {query}\n")
 
-# Retrieve and Generate
-response = bedrock_runtime.retrieve_and_generate(
-    input={"text": query},
-    retrieveAndGenerateConfiguration={
-        "type": "KNOWLEDGE_BASE",
-        "knowledgeBaseConfiguration": {
-            "knowledgeBaseId": KB_ID,
-            "modelArn": MODEL_ARN,
-            "retrievalConfiguration": {
-                "vectorSearchConfiguration": {"numberOfResults": 5}
-            },
-        },
-    },
+kb = LocalKB("workshop-kb", chunker="markdown_header")
+hits = kb.retrieve(query, top_k=5)
+
+if not hits:
+    print("No chunks indexed. Did you run create_knowledge_base.py first?")
+    sys.exit(1)
+
+context = "\n\n---\n\n".join(
+    f"[source={h.metadata.get('source')} score={h.score:.3f}]\n{h.text}"
+    for h in hits
 )
 
-# Print the generated answer
+client = OpenAI(api_key=ATLAS_API_KEY, base_url=ATLAS_BASE_URL)
+resp = client.chat.completions.create(
+    model=ATLAS_MODEL,
+    messages=[
+        {"role": "system",
+         "content": "Answer the user's question using ONLY the provided context. "
+                    "Cite source filenames in brackets like [metric-definitions.md]."},
+        {"role": "user",
+         "content": f"Context:\n{context}\n\nQuestion: {query}"},
+    ],
+)
+
 print("💬 Answer:")
-print(response["output"]["text"])
+print(resp.choices[0].message.content)
 
-# Print citations
-citations = response.get("citations", [])
-if citations:
-    print(f"\n📚 Sources ({len(citations)} citations):")
-    for i, citation in enumerate(citations, 1):
-        refs = citation.get("retrievedReferences", [])
-        for ref in refs:
-            location = ref.get("location", {}).get("s3Location", {})
-            uri = location.get("uri", "Unknown")
-            print(f"  [{i}] {uri}")
+print(f"\n📚 Sources ({len(hits)} chunks):")
+seen: set[str] = set()
+for h in hits:
+    src = h.metadata.get("source", "?")
+    if src not in seen:
+        seen.add(src)
+        print(f"  - {src}")
 
-# Verbose: show chunk details
 if verbose:
     print("\n" + "=" * 60)
     print("RETRIEVAL DETAILS")
     print("=" * 60)
-
-    retrieve_response = bedrock_runtime.retrieve(
-        knowledgeBaseId=KB_ID,
-        retrievalQuery={"text": query},
-        retrievalConfiguration={
-            "vectorSearchConfiguration": {"numberOfResults": 5}
-        },
-    )
-
-    for i, result in enumerate(retrieve_response["retrievalResults"], 1):
-        score = result.get("score", 0)
-        text = result.get("content", {}).get("text", "")[:200]
-        location = result.get("location", {}).get("s3Location", {}).get("uri", "")
-        print(f"\n--- Chunk {i} (score: {score:.4f}) ---")
-        print(f"Source: {location}")
-        print(f"Text: {text}...")
+    for i, h in enumerate(hits, 1):
+        print(f"\n--- Chunk {i} (score: {h.score:.4f}) ---")
+        print(f"Source: {h.metadata.get('source')}")
+        print(f"Section: {h.metadata.get('section_title','')}")
+        print(f"Text: {h.text[:200]}...")

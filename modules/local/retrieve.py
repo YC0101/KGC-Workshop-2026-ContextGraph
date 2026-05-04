@@ -1,50 +1,24 @@
-"""In-memory RAG retrieve tool over the AFS sample documents.
+"""Strands @tool that retrieves from the LocalKB built by Module 01.
 
-Chunks the markdown files in modules/01-knowledge-base-setup/data on first use,
-embeds each chunk with LM Studio (Qwen3), and serves top-k cosine matches
-for queries from the agent.
+If the default KB is empty (user hasn't run create_knowledge_base.py yet)
+this auto-ingests the AFS sample docs so the tool is usable from a fresh
+checkout. After that it uses whatever's in the persistent Chroma collection.
 """
-import re
-from dataclasses import dataclass
-from pathlib import Path
-
-import numpy as np
 from strands import tool
 
-from .config import DATA_DIR
-from .embed import embed_texts
+from .kb import default_kb
 
 
-@dataclass
-class Chunk:
-    source: str
-    text: str
+_kb = None
 
 
-def _split_markdown(text: str) -> list[str]:
-    """Split on top-level (## / ###) markdown headings, keeping the heading with its body."""
-    parts = re.split(r"(?=^#{2,3}\s)", text, flags=re.MULTILINE)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _load_chunks() -> list[Chunk]:
-    chunks: list[Chunk] = []
-    for path in sorted(Path(DATA_DIR).glob("*.md")):
-        for piece in _split_markdown(path.read_text()):
-            chunks.append(Chunk(source=path.name, text=piece))
-    return chunks
-
-
-_chunks: list[Chunk] | None = None
-_matrix: np.ndarray | None = None
-
-
-def _ensure_indexed() -> tuple[list[Chunk], np.ndarray]:
-    global _chunks, _matrix
-    if _chunks is None:
-        _chunks = _load_chunks()
-        _matrix = embed_texts(c.text for c in _chunks)
-    return _chunks, _matrix  # type: ignore[return-value]
+def _get_kb():
+    global _kb
+    if _kb is None:
+        _kb = default_kb()
+        if _kb.count == 0:
+            _kb.ingest_data_dir()
+    return _kb
 
 
 @tool
@@ -58,15 +32,14 @@ def retrieve(query: str, top_k: int = 5) -> str:
     Returns:
         Concatenated top-k chunks with source citations.
     """
-    chunks, matrix = _ensure_indexed()
-    q_vec = embed_texts([query])[0]
-    scores = matrix @ q_vec
-    idxs = np.argsort(-scores)[:top_k]
-
+    kb = _get_kb()
+    hits = kb.retrieve(query, top_k=top_k)
     blocks = []
-    for rank, i in enumerate(idxs, 1):
-        c = chunks[i]
-        blocks.append(
-            f"[{rank}] source={c.source} score={scores[i]:.3f}\n{c.text}"
-        )
+    for rank, h in enumerate(hits, 1):
+        src = h.metadata.get("source", "?")
+        section = h.metadata.get("section_title", "")
+        header = f"[{rank}] source={src} score={h.score:.3f}"
+        if section:
+            header += f" section={section!r}"
+        blocks.append(f"{header}\n{h.text}")
     return "\n\n---\n\n".join(blocks)
