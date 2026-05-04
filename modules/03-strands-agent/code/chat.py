@@ -1,23 +1,16 @@
-"""Interactive chat with the multi-agent system."""
-import os
-import json
-from strands import Agent, tool
-from strands.models.bedrock import BedrockModel
-from strands_tools import retrieve
+"""Interactive chat with the AFS Metrics Assistant (local stack)."""
+import sys
+from pathlib import Path
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-os.environ["KNOWLEDGE_BASE_ID"] = config["knowledge_base_id"]
+from strands import Agent  # noqa: E402
 
-model = BedrockModel(
-    model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
-    region_name="us-east-1",
-)
+from local.llm import build_llm  # noqa: E402
+from local.retrieve import retrieve  # noqa: E402
 
 agent = Agent(
-    model=model,
+    model=build_llm(),
     tools=[retrieve],
     system_prompt=(
         "You are the AFS Metrics Assistant. "

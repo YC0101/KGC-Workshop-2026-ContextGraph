@@ -1,16 +1,14 @@
-"""Strands agent with AFS-specific custom tools and KB retrieval."""
-import os
-import json
+"""Strands agent with AFS-specific custom tools and local-stack retrieval."""
+import sys
 from datetime import datetime, timezone
-from strands import Agent, tool
-from strands.models.bedrock import BedrockModel
-from strands_tools import retrieve
+from pathlib import Path
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-os.environ["KNOWLEDGE_BASE_ID"] = config["knowledge_base_id"]
+from strands import Agent, tool  # noqa: E402
+
+from local.llm import build_llm  # noqa: E402
+from local.retrieve import retrieve  # noqa: E402
 
 
 @tool
@@ -87,13 +85,8 @@ def check_grc_control(control_id: str) -> str:
     return f"Control {control_id} not found. Valid controls: {', '.join(controls.keys())}"
 
 
-model = BedrockModel(
-    model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
-    region_name="us-east-1",
-)
-
 agent = Agent(
-    model=model,
+    model=build_llm(),
     tools=[retrieve, classify_risk, get_period_info, check_grc_control],
     system_prompt=(
         "You are the AFS Metrics Assistant for AWS CapEx financial operations. You can:\n"

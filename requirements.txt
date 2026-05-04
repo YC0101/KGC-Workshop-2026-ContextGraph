@@ -1,8 +1,10 @@
 strands-agents>=0.1.0
 strands-agents-tools>=0.1.0
 boto3>=1.35.0
-opensearchpy>=2.4.0
+opensearch-py>=2.4.0
 gremlinpython>=3.7.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 rich>=13.0.0
+openai>=1.50.0
+numpy>=1.26.0

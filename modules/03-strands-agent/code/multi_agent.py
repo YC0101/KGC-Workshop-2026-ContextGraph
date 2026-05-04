@@ -1,22 +1,15 @@
 """Multi-agent system with AFS specialist agents."""
-import os
-import json
-from strands import Agent, tool
-from strands.models.bedrock import BedrockModel
-from strands_tools import retrieve
+import sys
+from pathlib import Path
 
-config_path = os.path.join(os.path.dirname(__file__), "..", "..", "kb_config.json")
-with open(config_path) as f:
-    config = json.load(f)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-os.environ["KNOWLEDGE_BASE_ID"] = config["knowledge_base_id"]
+from strands import Agent, tool  # noqa: E402
 
-model = BedrockModel(
-    model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
-    region_name="us-east-1",
-)
+from local.llm import build_llm  # noqa: E402
+from local.retrieve import retrieve  # noqa: E402
 
-# --- Specialist Agents ---
+model = build_llm()
 
 metrics_agent = Agent(
     model=model,
